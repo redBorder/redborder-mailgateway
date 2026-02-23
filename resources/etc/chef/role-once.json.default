@@ -1,0 +1,6 @@
+{
+  "run_list": [ "role[mailgateway-sensor]" ],
+  "redborder": {
+    "force-run-once": true
+  }
+}
