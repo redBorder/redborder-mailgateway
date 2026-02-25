@@ -40,6 +40,9 @@ cp resources/scripts/* %{buildroot}/usr/lib/redborder/scripts
 cp -r resources/etc/chef %{buildroot}/etc/
 chmod 0755 %{buildroot}/usr/lib/redborder/bin/*
 chmod 0755 %{buildroot}/usr/lib/redborder/scripts/*
+install -D -m 0644 resources/lib/rb_wiz_lib.rb %{buildroot}/usr/lib/redborder/lib
+install -D -m 0644 resources/lib/rb_config_utils.rb %{buildroot}/usr/lib/redborder/lib
+install -D -m 0644 resources/lib/rb_functions.sh %{buildroot}/usr/lib/redborder/lib
 install -D -m 0644 resources/systemd/rb-init-conf.service %{buildroot}/usr/lib/systemd/system/rb-init-conf.service
 install -D -m 0755 resources/lib/dhclient-enter-hooks %{buildroot}/usr/lib/redborder/lib/dhclient-enter-hooks
 
@@ -117,13 +120,17 @@ update-alternatives --set java $(find /usr/lib/jvm/*java-1.8.0-openjdk* -name "j
 /usr/lib/redborder/bin
 /usr/lib/redborder/scripts
 %defattr(0755,root,root)
+/etc/profile.d/redborder-mailgateway.sh
 /usr/lib/redborder/lib/dhclient-enter-hooks
 %defattr(0644,root,root)
 /etc/chef
 /etc/redborder
+/usr/lib/redborder/lib/rb_wiz_lib.rb
+/usr/lib/redborder/lib/rb_config_utils.rb
+/usr/lib/redborder/lib/rb_functions.sh
 /usr/lib/systemd/system/rb-init-conf.service
 %doc
 
 %changelog
-* Mon Mar 21 2026 Vicente Mesa <vimesa@redborder.com>
+* Mon Feb 23 2026 Vicente Mesa <vimesa@redborder.com>
 - first spec version

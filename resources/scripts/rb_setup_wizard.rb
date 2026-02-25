@@ -1,0 +1,323 @@
+#!/usr/bin/env ruby
+
+require 'json'
+require 'mrdialog'
+require 'yaml'
+require 'getopt/std'
+require "#{ENV['RBLIB']}/rb_wiz_lib"
+require "#{ENV['RBLIB']}/rb_config_utils.rb"
+
+CONFFILE = "#{ENV['RBETC']}/rb_init_conf.yml" unless CONFFILE
+DIALOGRC = "#{ENV['RBETC']}/dialogrc"
+if File.exist?(DIALOGRC)
+    ENV['DIALOGRC'] = DIALOGRC
+end
+
+opt = Getopt::Std.getopts("f")
+
+# Load old configuration if any
+init_conf = YAML.load_file(CONFFILE) rescue nil
+init_conf_webui_address = init_conf['webui_host'] rescue nil
+init_conf_cloud_address = init_conf['cloud_address'] rescue nil
+init_conf_network = init_conf['network'] rescue nil
+
+def cancel_wizard()
+
+    dialog = MRDialog.new
+    dialog.clear = true
+    dialog.title = "SETUP wizard cancelled"
+
+    text = <<EOF
+
+The setup has been cancelled or stopped.
+
+If you want to complete the setup wizard, please execute it again.
+
+EOF
+    result = dialog.msgbox(text, 11, 41)
+    exit(1)
+
+end
+
+def local_tty_warning_wizard()
+
+    dialog = MRDialog.new
+    dialog.clear = true
+    dialog.title = "SETUP wizard cancelled"
+
+    text = <<EOF
+
+This device must be configured under local tty.
+
+If you want to complete the setup wizard, please execute it again in a local tty.
+
+EOF
+    result = dialog.msgbox(text, 11, 41)
+    exit(1)
+
+end
+
+# Run the wizard only in local tty
+local_tty_warning_wizard unless Config_utils.is_local_tty or opt["f"]
+
+# init
+puts "Getting data. Please wait ... "
+
+puts "\033]0;redborder - setup wizard\007"
+
+general_conf = {
+    "webui_host" => "rblive.redborder.com",
+    "webui_user" => "admin",
+    "gateway_node_name" => "gateway-sensor",
+    "webui_pass" => "",
+    "registration_mode" => "proxy",
+    "cloud_address" => "rblive.redborder.com",
+    "network" => {
+        "interfaces" => [],
+        "dns" => []
+        }
+    }
+
+# general_conf will dump its contents as yaml conf into rb_init_conf.yml
+
+# TODO: intro to the wizard, define color set, etc.
+
+text = <<EOF
+
+This wizard will guide you through the necessary configuration of the device
+in order to convert it into a redborder mailgateway sensor.
+
+It will go through the following required steps: network configuration,
+domain and DNS. After that this process will perform
+a sensor regitration within the redborder manager.
+
+Would you like to continue?
+
+EOF
+
+dialog = MRDialog.new
+dialog.clear = true
+dialog.title = "Configure wizard"
+yesno = dialog.yesno(text,0,0)
+
+unless yesno # yesno is "yes" -> true
+    cancel_wizard
+end
+
+##########################
+# NETWORK CONFIGURATION  #
+##########################
+
+text = <<EOF
+
+Next, you will be able to configure network settings. If you have
+the network configured manually, you can "SKIP" this step and go
+to the next step.
+
+Please, Select an option.
+
+EOF
+
+dialog = MRDialog.new
+dialog.clear = true
+dialog.title = "Configure Network"
+dialog.cancel_label = "SKIP"
+dialog.no_label = "SKIP"
+yesno = (init_conf_network.nil? or init_conf_network['interfaces'].empty?) ? true : dialog.yesno(text,0,0)
+
+if yesno # yesno is "yes" -> true
+
+    # Conf for network
+    netconf = NetConf.new
+    loop do
+        netconf.doit # launch wizard
+        cancel_wizard and break if netconf.cancel
+        general_conf["network"]["interfaces"] = netconf.conf
+        break unless general_conf["network"]["interfaces"].empty?
+    end
+
+
+    # Conf for DNS
+    text = <<EOF
+
+Do you want to configure DNS servers?
+
+If you have configured the network as Dynamic and
+you get the DNS servers via DHCP, you should say
+'No' to this  question.
+
+EOF
+
+    dialog = MRDialog.new
+    dialog.clear = true
+    dialog.title = "CONFIGURE DNS"
+    yesno = dialog.yesno(text,0,0)
+
+    if yesno # yesno is "yes" -> true
+        # configure dns
+        dnsconf = DNSConf.new
+        dnsconf.doit # launch wizard
+        cancel_wizard if dnsconf.cancel
+        general_conf["network"]["dns"] = dnsconf.conf
+    else
+        general_conf["network"].delete("dns")
+    end
+end
+
+##############################
+# INTERFACES  CONFIGURATION  #
+##############################
+management_iface = nil
+
+if general_conf["network"]["interfaces"].size > 0
+    interface_options = general_conf["network"]["interfaces"].map { |i| [i["device"]] }
+    text = <<EOF
+You have multiple network interfaces configured.
+Please select one to be used as the management interface.
+EOF
+    dialog = MRDialog.new
+    dialog.clear = true
+    dialog.title = "Select Management Interface"
+    management_iface = dialog.menu(text, interface_options, 10, 50)
+end
+
+if management_iface.nil?
+  cancel_wizard
+else
+  general_conf["network"]["management_interface"] = management_iface
+end
+
+################
+# Registration #
+################
+
+registration_mode = ModeConf.new
+registration_mode.doit
+general_conf["registration_mode"] = registration_mode.conf.to_s
+registration_mode = general_conf["registration_mode"]
+cancel_wizard if registration_mode == ""
+
+make_registration = true
+unless init_conf_cloud_address.nil? || init_conf_webui_address.nil?
+    dialog = MRDialog.new
+    dialog.clear = true
+    dialog.title = "Confirm configuration"
+    text = <<EOF
+
+There was a previous wizard execution and your Mail-Gateway may had been registered already, do you want to register again?
+
+EOF
+    make_registration = dialog.yesno(text,0,0)
+end
+
+if make_registration
+    if registration_mode == "proxy"
+        ###############################
+        # CLOUD ADDRESS CONFIGURATION #
+        ###############################
+
+        # Conf for hostname and domain
+        cloud_address_conf = CloudAddressConf.new
+        cloud_address_conf.doit # launch wizard
+        cancel_wizard if cloud_address_conf.cancel
+        general_conf["cloud_address"] = cloud_address_conf.conf[:cloud_address]
+        general_conf["cdomain"] = cloud_address_conf.conf[:cdomain]
+    else
+        ###############################
+        #      SSH CONFIGURATION      #
+        ###############################
+
+        # Conf for hostname and domain
+        init_conf_webui_address_conf = RegularRegistration.new
+        init_conf_webui_address_conf.doit # launch wizard
+        cancel_wizard if init_conf_webui_address_conf.cancel
+        general_conf["webui_host"] = init_conf_webui_address_conf.conf[:host]
+        general_conf["webui_user"] = init_conf_webui_address_conf.conf[:user]
+        general_conf["webui_pass"] = init_conf_webui_address_conf.conf[:pass]
+        general_conf["gateway_node_name"] = init_conf_webui_address_conf.conf[:node_name]
+        general_conf["cdomain"] = init_conf_webui_address_conf.conf[:cdomain]
+    end
+end
+
+###############################
+#     BUILD DESCRIPTION       #
+###############################
+
+# Confirm
+text = <<EOF
+
+You have selected the following parameter values for your configuration:
+
+EOF
+
+unless general_conf["network"]["interfaces"].empty?
+    text += "- Networking:\n"
+    general_conf["network"]["interfaces"].each do |i|
+        text += "    device: #{i["device"]}\n"
+        text += "    mode: #{i["mode"]}\n"
+        if i["mode"] == "static"
+            text += "    ip: #{i["ip"]}\n"
+            text += "    netmask: #{i["netmask"]}\n"
+            unless i["gateway"].nil? or i["gateway"] == ""
+                text += "    gateway: #{i["gateway"]}\n"
+            end
+        end
+        text += "\n"
+    end
+end
+
+unless general_conf["network"]["management_interface"].nil?
+    text += "- Management Interface:\n"
+    text += "    #{general_conf["network"]["management_interface"]}\n"
+end
+
+unless general_conf["network"]["dns"].nil? or general_conf["network"]["dns"].empty?
+    text += "\n- DNS:\n"
+    general_conf["network"]["dns"].each do |dns|
+        text += "    #{dns}\n"
+    end
+end
+
+text += "\n- Make Registration: #{make_registration}\n"
+text += "    Mode: #{registration_mode}\n"
+
+if registration_mode == "proxy" and make_registration
+    text += "\n- Cloud address: #{general_conf["cloud_address"]}\n"
+    general_conf.delete('webui_host')
+    general_conf.delete('webui_user')
+    general_conf.delete('webui_pass')
+    general_conf.delete('gateway_node_name')
+elsif make_registration
+    general_conf.delete('cloud_address')
+    text += "    Host : #{general_conf['webui_host']}\n"
+    text += "    User : #{general_conf['webui_user']}\n"
+    text += "    Pass : #{'*' * general_conf['webui_pass'].length}\n"
+    text += "    Sensor Name: #{general_conf['gateway_node_name']}\n"
+end
+text += "\n- Cloud Domain: #{general_conf['cdomain']}\n"
+
+text += "\nPlease, is this configuration ok?\n \n"
+
+dialog = MRDialog.new
+dialog.clear = true
+dialog.title = "Confirm configuration"
+yesno = dialog.yesno(text,0,0)
+
+unless yesno # yesno is "yes" -> true
+    cancel_wizard
+end
+
+File.open(CONFFILE, 'w') {|f| f.write general_conf.to_yaml } #Store
+
+#exec("#{ENV['RBBIN']}/rb_init_conf.sh")
+command_opts = ""
+command_opts = "-r" if make_registration
+command_opts += " -f" if opt["f"]
+command = "#{ENV['RBBIN']}/rb_init_conf #{command_opts}"
+
+dialog = MRDialog.new
+dialog.clear = false
+dialog.title = "Applying configuration"
+dialog.prgbox(command,20,100, "Executing rb_init_conf")
+
+## vim:ts=4:sw=4:expandtab:ai:nowrap:formatoptions=croqln:

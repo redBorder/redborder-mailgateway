@@ -1,0 +1,969 @@
+#!/usr/bin/env ruby
+
+require 'mrdialog'
+require 'net/ip'
+require 'system/getifaddrs'
+require 'netaddr'
+require 'uri'
+require File.join(ENV['RBDIR'].nil? ? '/usr/lib/redborder' : ENV['RBDIR'],'lib/rb_config_utils.rb')
+
+CONFFILE = "#{ENV['RBETC']}/rb_init_conf.yml"
+LOGFILE  = "/tmp/rb_setup_wizard.log"
+
+class WizConf
+
+    # Read propierties from sysfs for a network devices
+    def netdev_property(devname)
+        netdev = {}
+        IO.popen("udevadm info -q property -p /sys/class/net/#{devname} 2>/dev/null").each do |line|
+            unless line.match(/^(?<key>[^=]*)=(?<value>.*)$/).nil?
+                netdev[line.match(/^(?<key>[^=]*)=(?<value>.*)$/)[:key]] = line.match(/^(?<key>[^=]*)=(?<value>.*)$/)[:value]
+            end
+        end
+        if File.exist?"/sys/class/net/#{devname}/address"
+            f = File.new("/sys/class/net/#{devname}/address",'r')
+            netdev["MAC"] = f.gets.chomp
+            f.close
+        end
+        if File.exist?"/sys/class/net/#{devname}/operstate"
+            f = File.new("/sys/class/net/#{devname}/operstate",'r')
+            netdev["STATUS"] = f.gets.chomp
+            f.close
+        end
+
+        netdev
+    end
+
+end
+
+# Class to create a Network configuration box
+class NetConf < WizConf
+
+    attr_accessor :conf, :cancel
+
+    def initialize
+        @cancel = false
+        @conf = []
+        @confdev = {}
+        @devmode = { "dhcp" => "Dynamic", "static" => "Static" }
+        @devmodereverse = { "Dynamic" => "dhcp", "Static" => "static" }
+    end
+
+    def doit
+        dialog = MRDialog.new
+        dialog.clear = true
+        dialog.title = "CONFIGURE NETWORK"
+        loop do
+            text = <<EOF
+
+This is the network device configuration box.
+
+Please, choose a network device to configure. Once you
+have entered and configured all devices, you must select
+last choise (Finalize) and 'Accept' to continue.
+
+Any device not configured will be set to Dynamic (DHCP)
+mode by default.
+
+EOF
+            items = []
+            menu_data = Struct.new(:tag, :item)
+            data = menu_data.new
+            # loop over list of net devices
+            listnetdev = Dir.entries("/sys/class/net/").select {|f| !File.directory? f}
+            listnetdev.each do |netdev|
+                # loopback and devices with no pci nor mac are not welcome!
+                next if netdev == "lo"
+                netdevprop = netdev_property(netdev)
+                next unless ((netdevprop["ID_BUS"] == "pci" or netdevprop["ID_BUS"] == "usb") and !netdevprop["MAC"].nil?)
+                data.tag = netdev
+                # set default value
+                @confdev[netdev] = {"mode" => "dhcp"} if @confdev[netdev].nil?
+                data.item = "MAC: #{netdevprop["MAC"]}, Vendor: #{netdevprop["ID_MODEL_FROM_DATABASE"]}"
+                items.push(data.to_a)
+            end
+            data.tag = "Finalize"
+            data.item = "Finalize network device configuration"
+            items.push(data.to_a)
+            height = 0
+            width = 0
+            menu_height = 4
+            selected_item = dialog.menu(text, items, height, width, menu_height)
+
+            if selected_item
+                unless selected_item == "Finalize"
+                    dev = DevConf.new(selected_item)
+                    unless @confdev[selected_item].nil?
+                        dev.conf = {'IP:' => @confdev[selected_item]["ip"],
+                                    'Netmask:' => @confdev[selected_item]["netmask"],
+                                    'Gateway:' => @confdev[selected_item]["gateway"],
+                                    'Mode:' => @devmode[@confdev[selected_item]["mode"]]}
+                    end
+                    dev.doit
+                    unless dev.conf.empty?
+                        @confdev[selected_item] = {}
+                        @confdev[selected_item]["mode"] = @devmodereverse[dev.conf['Mode:']]
+                        if dev.conf['Mode:'] == "Static"
+                            @confdev[selected_item]["ip"] = dev.conf['IP:']
+                            @confdev[selected_item]["netmask"] = dev.conf['Netmask:']
+                            unless dev.conf['Gateway:'].nil? or dev.conf['Gateway:'].empty?
+                                @confdev[selected_item]["gateway"] = dev.conf['Gateway:']
+                            else
+                                @confdev[selected_item]["gateway"] = ""
+                            end
+
+                        end
+                    end
+                else
+                    break
+                end
+            else
+                # Cancel pressed
+                @cancel = true
+                break
+            end
+        end
+        @confdev.each_key do |interface|
+            @conf << @confdev[interface].merge("device" => interface)
+        end
+    end
+end
+
+class DevConf < WizConf
+
+    attr_accessor :device_name, :conf, :cancel
+
+    def initialize(x)
+        @cancel = false
+        @device_name = x
+        @conf = {}
+    end
+
+    def doit
+        # first, set mode dynamic or static
+        dialog = MRDialog.new
+        dialog.clear = true
+        text = <<EOF
+
+Please, select type of configuration:
+
+Dynamic: set dynamic IP/Netmask and Gateway
+         via DHCP client.
+Static: You will provide configuration for
+        IP/Netmask and Gateway, if needed.
+
+EOF
+        items = []
+        radiolist_data = Struct.new(:tag, :item, :select)
+        data = radiolist_data.new
+        data.tag = "Dynamic"
+        data.item = "IP/Netmask and Gateway via DHCP"
+        if @conf['Mode:'].nil?
+            data.select = true # default
+        else
+            if @conf['Mode:'] == "Dynamic"
+                data.select = true
+            else
+                data.select = false
+            end
+        end
+        items.push(data.to_a)
+
+        data = radiolist_data.new
+        data.tag = "Static"
+        data.item = "IP/Netamsk and Gateway static values"
+        if @conf['Mode:'].nil?
+            data.select = false # default
+        else
+            if @conf['Mode:'] == "Static"
+                data.select = true
+            else
+                data.select = false
+            end
+        end
+        items.push(data.to_a)
+
+        dialog.title = "Network Device Mode"
+        selected_item = dialog.radiolist(text, items)
+        exit_code = dialog.exit_code
+
+        case exit_code
+        when dialog.dialog_ok
+            # OK Pressed
+
+            # TODO ipv6 support
+            if selected_item == "Static"
+                dialog = MRDialog.new
+                dialog.clear = true
+                text = <<EOF
+
+You are about to configure the network device #{@device_name}. It has the following propierties:
+EOF
+                netdevprop = netdev_property(@device_name)
+
+                text += " \n"
+                text += "MAC: #{netdevprop["MAC"]}\n"
+                text += "DRIVER: #{netdevprop["ID_NET_DRIVER"]}\n" unless netdevprop["ID_NET_DRIVER"].nil?
+                text += "PCI PATH: #{netdevprop["ID_PATH"]}\n" unless netdevprop["ID_PATH"].nil?
+                text += "VENDOR: #{netdevprop["ID_VENDOR_FROM_DATABASE"]}\n" unless netdevprop["ID_VENDOR_FROM_DATABASE"].nil?
+                text += "MODEL: #{netdevprop["ID_MODEL_FROM_DATABASE"]}\n" unless netdevprop["ID_MODEL_FROM_DATABASE"].nil?
+                text += "STATUS: #{netdevprop["STATUS"]}\n" unless netdevprop["STATUS"].nil?
+                text += " \n"
+
+                @conf['IP:'] = Config_utils.get_ipv4_network(@device_name)[:ip] if @conf['IP:'].nil?
+                @conf['Netmask:'] = Config_utils.get_ipv4_network(@device_name)[:netmask] if @conf['Netmask:'].nil?
+                @conf['Gateway:'] = Config_utils.get_ipv4_network(@device_name)[:gateway] if @conf['Gateway:'].nil?
+
+                flen = 20
+                form_data = Struct.new(:label, :ly, :lx, :item, :iy, :ix, :flen, :ilen)
+
+                loop do
+                    items = []
+                    label = "IP:"
+                    data = form_data.new
+                    data.label = label
+                    data.ly = 1
+                    data.lx = 1
+                    data.item = @conf[label]
+                    data.iy = 1
+                    data.ix = 10
+                    data.flen = flen
+                    data.ilen = 0
+                    items.push(data.to_a)
+
+                    label = "Netmask:"
+                    data = form_data.new
+                    data.label = label
+                    data.ly = 2
+                    data.lx = 1
+                    data.item = @conf[label]
+                    data.iy = 2
+                    data.ix = 10
+                    data.flen = flen
+                    data.ilen = 0
+                    items.push(data.to_a)
+
+                    label = "Gateway:"
+                    data = form_data.new
+                    data.label = label
+                    data.ly = 3
+                    data.lx = 1
+                    data.item = @conf[label]
+                    data.iy = 3
+                    data.ix = 10
+                    data.flen = flen
+                    data.ilen = 0
+                    items.push(data.to_a)
+
+                    dialog.title = "Network configuration for #{@device_name}"
+                    @conf = dialog.form(text, items, 20, 60, 0)
+
+                    # need to check result
+                    ret = true
+                    if @conf.empty?
+                        # Cancel was pressed
+                        break
+                    else
+                        # ok pressed
+                        @conf['Mode:'] = "Static"
+                        if Config_utils.check_ipv4({:ip => @conf['IP:']}) and Config_utils.check_ipv4({:netmask => @conf['Netmask:']})
+                            # seems to be ok
+                            unless @conf['Gateway:'] == ""
+                                if Config_utils.check_ipv4({:ip => @conf['Gateway:']})
+                                    # seems to be ok
+                                    ret = false
+                                end
+                            else
+                                ret = false
+                            end
+                        else
+                            # error!
+                            ret = true
+                        end
+                    end
+                    if ret
+                        # error detected
+                        dialog = MRDialog.new
+                        dialog.clear = true
+                        dialog.title = "ERROR in network configuration"
+                        text = <<EOF
+
+We have detected an error in network configuration.
+
+Please, review IP/Netmask and/or Gateway address configuration.
+EOF
+                        dialog.msgbox(text, 10, 41)
+                    else
+                        # all it is ok, breaking loop
+                        break
+                    end
+                end
+            else
+                # selected_item == "Dynamic"
+                @conf['Mode:'] = "Dynamic"
+            end
+
+        when dialog.dialog_cancel
+            # Cancel Pressed
+
+        when dialog.dialog_esc
+            # Escape Pressed
+
+        end
+
+
+    end
+
+end
+
+# Class to create a Network configuration box
+class IpmiConf < WizConf
+
+    attr_accessor :conf, :cancel
+
+    def initialize()
+        @cancel = false
+        @conf = {}
+    end
+
+    def doit
+        dialog = MRDialog.new
+        dialog.clear = true
+
+        ipmi_properties = Config_utils.get_ipmi_properties
+
+        @conf['IP:'] = ipmi_properties[:ip] if @conf['IP:'].nil?
+        @conf['Netmask:'] = ipmi_properties[:netmask] if @conf['Netmask:'].nil?
+        @conf['Gateway:'] = ipmi_properties[:gateway] if @conf['Gateway:'].nil?
+
+        flen = 20
+        form_data = Struct.new(:label, :ly, :lx, :item, :iy, :ix, :flen, :ilen)
+
+        loop do
+            text = <<EOF
+
+You are about to configure the IPMI. It has the following propierties:
+EOF
+            items = []
+            label = "IP:"
+            data = form_data.new
+            data.label = label
+            data.ly = 1
+            data.lx = 1
+            data.item = @conf[label]
+            data.iy = 1
+            data.ix = 10
+            data.flen = flen
+            data.ilen = 0
+            items.push(data.to_a)
+
+            label = "Netmask:"
+            data = form_data.new
+            data.label = label
+            data.ly = 2
+            data.lx = 1
+            data.item = @conf[label]
+            data.iy = 2
+            data.ix = 10
+            data.flen = flen
+            data.ilen = 0
+            items.push(data.to_a)
+
+            label = "Gateway:"
+            data = form_data.new
+            data.label = label
+            data.ly = 3
+            data.lx = 1
+            data.item = @conf[label]
+            data.iy = 3
+            data.ix = 10
+            data.flen = flen
+            data.ilen = 0
+            items.push(data.to_a)
+
+            dialog.title = "IPMI configuration"
+            @conf = dialog.form(text, items, 20, 60, 0)
+
+            # need to check result
+            ret = true
+            if @conf.empty?
+                # Cancel was pressed
+                #@cancel = true
+                break
+            else
+                # ok pressed
+                if Config_utils.check_ipv4({:ip => @conf['IP:']}) and Config_utils.check_ipv4({:netmask => @conf['Netmask:']})
+                    # seems to be ok
+                    unless @conf['Gateway:'] == ""
+                        if Config_utils.check_ipv4({:ip => @conf['Gateway:']})
+                            # seems to be ok
+                            ret = false
+                        end
+                    else
+                        ret = false
+                    end
+                else
+                    # error!
+                    ret = true
+                end
+            end
+            if ret
+                # error detected
+                dialog = MRDialog.new
+                dialog.clear = true
+                dialog.title = "ERROR in IPMI network configuration"
+                text = <<EOF
+
+We have detected an error in IPMI network configuration.
+
+Please, review IP/Netmask and/or Gateway address configuration.
+EOF
+                dialog.msgbox(text, 10, 41)
+            else
+                # all it is ok, breaking loop
+                break
+            end
+        end
+
+    end #doit
+
+end
+
+class PortConf < WizConf
+
+    attr_accessor :conf, :cancel
+
+    def initialize
+        @cancel = false
+        @conf = {}
+    end
+
+    def doit
+        dialog = MRDialog.new
+        dialog.clear = true
+        dialog.title = "PORTS INFORMATION"
+        dialog.logger = Logger.new(LOGFILE)
+        loop do
+            text = <<EOF
+
+Port Network configuration menu:
+
+EOF
+
+            text += "\n"
+
+            text += "Ethernet: \n"
+            items = []
+            menu_data = Struct.new(:tag, :item)
+            data = menu_data.new
+            # loop over list of net devices
+            listnetdev = Dir.entries("/sys/class/net/").select {|f| !File.directory? f}
+            listnetdev.each do |netdev|
+                # loopback and devices with no pci nor mac are not welcome!
+                next if netdev == "lo"
+                netdevprop = netdev_property(netdev)
+                next unless ((netdevprop["ID_BUS"] == "pci" or netdevprop["ID_BUS"] == "usb") and !netdevprop["MAC"].nil?)
+
+                text += "- #{netdev}"
+                text += " | Mode Port: #{Config_utils.get_pether_speed(netdev)}/#{Config_utils.get_pether_duplex(netdev)} "
+                text += " | MAC Address: #{netdevprop["MAC"]} "
+                text += " | Status: #{Config_utils.get_pether_status(netdev)} \n"
+
+                data.tag = netdev
+                data.item = "MAC: #{netdevprop["MAC"]}, Vendor: #{netdevprop["ID_MODEL_FROM_DATABASE"]}"
+                items.push(data.to_a)
+            end
+            text += "\n"
+            text +=" Please, choose a network device to perform port identification: \n"
+            text += "\n"
+            data.tag = "Finalize"
+            data.item = "Finalize port network identification"
+            items.push(data.to_a)
+            height = 0
+            width = 0
+            menu_height = 4
+            selected_item = dialog.menu(text, items, height, width, menu_height)
+
+            exit_code = dialog.exit_code
+
+            dialog.logger.debug("Exit code: #{exit_code}")
+
+            if selected_item
+                unless selected_item == "Finalize"
+                    netdev = selected_item
+                    dialog = MRDialog.new
+                    dialog.clear = true
+                    text = <<EOF
+
+Port Blinking for identification (#{netdev}).  \n
+Please set the time for blinking.
+EOF
+
+                    items = []
+                    form_data = Struct.new(:label, :ly, :lx, :item, :iy, :ix, :flen, :ilen, :attr)
+
+                    items = []
+                    label = "Seconds:"
+                    data = form_data.new
+                    data.label = label
+                    data.ly = 1
+                    data.lx = 1
+                    data.item = 30
+                    data.iy = 1
+                    data.ix = 10
+                    data.flen = 253
+                    data.ilen = 0
+                    data.attr = 0
+                    items.push(data.to_a)
+
+                    dialog.title = "Blinking in seconds"
+                    seconds = dialog.mixedform(text, items, 24, 60, 0)
+                    seconds = seconds["Seconds:"].to_i rescue 30
+
+                    dialog = MRDialog.new
+                    dialog.clear = true
+                    dialog.title = "Port blinking"
+                    description="The port should be blinking for #{seconds} seconds."
+                    height = 20
+                    width = 70
+                    percent = 0
+                    dialog.progressbox(description,height, width) do |f|
+                        system("ethtool -p #{netdev} #{seconds} &")
+                        for second in 1..seconds
+                            f.puts "Blinking port #{netdev} for #{second} seconds.."
+                            sleep 1
+                        end
+                    end
+
+                    break
+                end
+            else
+                # Cancel pressed
+                @cancel = true
+                break
+            end
+
+        end # loop
+    end # doit
+end
+
+class CloudAddressConf < WizConf
+
+    attr_accessor :conf, :cancel
+
+    def initialize()
+        @cancel = false
+        @conf = {}
+    end
+
+    def doit
+
+        host = {}
+        @conf["Cloud address:"] = "rblive.redborder.com"
+        @conf["Domain name:"] = "redborder.cluster"
+
+        loop do
+            dialog = MRDialog.new
+            dialog.clear = true
+            dialog.insecure = true
+            text = <<EOF
+
+Please, set cloud address of the redborder manager.
+
+Do not use http:// or https:// in front, introduce the url domain name of the manager.
+
+EOF
+            items = []
+            form_data = Struct.new(:label, :ly, :lx, :item, :iy, :ix, :flen, :ilen, :attr)
+
+            items = []
+            label = "Cloud address:"
+            data = form_data.new
+            data.label = label
+            data.ly = 1
+            data.lx = 1
+            data.item = @conf[label]
+            data.iy = 1
+            data.ix = 16
+            data.flen = 253
+            data.ilen = 0
+            data.attr = 0
+            items.push(data.to_a)
+
+            label = "Domain name:"
+            data = form_data.new
+            data.label = label
+            data.ly = 2
+            data.lx = 1
+            data.item = @conf[label]
+            data.iy = 2
+            data.ix = 16
+            data.flen = 253
+            data.ilen = 0
+            data.attr = 0
+            items.push(data.to_a)
+
+            dialog.title = "Cloud address configuration"
+            host = dialog.mixedform(text, items, 24, 60, 0)
+
+            if host.empty?
+                # Cancel button pushed
+                @cancel = true
+                break
+            else
+                if Config_utils.check_cloud_address(host["Cloud address:"]) and Config_utils.check_domain(host["Domain name:"])
+                    # need to confirm lenght
+                    if (host["Cloud address:"].length < 254 and host["Domain name:"].length < 254)
+                        break
+                    end
+                end
+            end
+
+            # error, do another loop
+            dialog = MRDialog.new
+            dialog.clear = true
+            dialog.title = "ERROR in name configuration"
+            text = <<EOF
+
+We have detected an error in cloud address configuration.
+
+Please, review character set and length for name configuration.
+EOF
+            dialog.msgbox(text, 10, 41)
+
+        end
+
+        @conf[:cloud_address] = host["Cloud address:"]
+        @conf[:cdomain] = host["Domain name:"]
+
+    end
+
+end
+
+class ModeConf < WizConf
+
+    attr_accessor :conf, :cancel
+
+    def initialize()
+        @cancel = false
+        @conf = ""
+    end
+
+    def doit
+
+        modelist = [
+            {"name"=>"proxy", "description"=>"Register Mail-Gateway sensor in proxy mode"},
+            {"name"=>"manager", "description"=>"Register Mail-Gateway sensor to a manager"}
+            ]
+
+        dialog = MRDialog.new
+        dialog.clear = true
+        text = <<EOF
+
+Please, select mode of registration of the Mail-Gateway
+EOF
+        items = []
+        radiolist_data = Struct.new(:tag, :item, :select)
+
+        modelist.each do |m|
+            data = radiolist_data.new
+            data.tag = m['name']
+            data.item = m['description']
+            data.select = m['name'] == 'manager' ? true : false
+            items.push(data.to_a)
+        end
+
+        dialog.title = "Set registration method"
+        selected_item = dialog.radiolist(text, items)
+
+        if dialog.exit_code == dialog.dialog_cancel
+            @cancel = true
+        elsif dialog.exit_code == dialog.dialog_ok
+            @conf = selected_item
+        end
+    end
+end
+
+class RegularRegistration < WizConf
+
+    attr_accessor :conf, :cancel
+
+    def initialize()
+        @cancel = false
+        @conf = {}
+    end
+
+    def doit
+        host = {}
+        @conf["host"] = "rblive.redborder.com"
+        @conf["Domain name"] = "redborder.cluster"
+        @conf["user"] = "admin"
+        @conf["pass"] = ""
+
+        loop do
+            dialog = MRDialog.new
+            dialog.clear = true
+            dialog.insecure = true
+            textpassword = <<EOF
+
+Please, set password of the manager (web) to connect to
+EOF
+            text = <<EOF
+
+Please, set user and password of the manager
+
+This will register the sensor to the manager using the webui, so make sure it is reachable.
+
+Do not use http:// or https:// in front, introduce the URL domain name of the manager.
+
+EOF
+            items = []
+            passitems = []
+            form_data = Struct.new(:label, :ly, :lx, :item, :iy, :ix, :flen, :ilen, :attr)
+            form_password = Struct.new(:label, :ly, :lx, :item, :iy, :ix, :flen, :ilen)
+
+            label = "Address"
+            data = form_data.new
+            data.label = label
+            data.ly = 1
+            data.lx = 1
+            data.item = @conf["host"]
+            data.iy = 1
+            data.ix = 16
+            data.flen = 253
+            data.ilen = 0
+            data.attr = 0
+            items.push(data.to_a)
+
+            # Node name
+            label = "Domain name"
+            data = form_data.new
+            data.label = label
+            data.ly = 2
+            data.lx = 1
+            data.item = @conf[label]
+            data.iy = 2
+            data.ix = 16
+            data.flen = 253
+            data.ilen = 0
+            data.attr = 0
+            items.push(data.to_a)
+
+            # User input
+            label = "User"
+            data = form_data.new
+            data.label = label
+            data.ly = 3
+            data.lx = 1
+            data.item = @conf["user"]
+            data.iy = 3
+            data.ix = 16
+            data.flen = 253
+            data.ilen = 0
+            data.attr = 0
+            items.push(data.to_a)
+
+            # Node name
+            label = "Sensor Name"
+            data = form_data.new
+            data.label = label
+            data.ly = 4
+            data.lx = 1
+            data.item = Config_utils.generate_random_hostname
+            data.iy = 4
+            data.ix = 16
+            data.flen = 253
+            data.ilen = 0
+            data.attr = 0
+            items.push(data.to_a)
+
+            dialog.title = "WebUI Sensor Registration Configuration"
+            form_results = dialog.mixedform(text, items, 24, 60, 0)
+
+            if form_results.empty?
+                # Cancel button pushed
+                @cancel = true
+                break
+            end
+
+            # Password input
+            label = "Password"
+            data = form_password.new
+            data.label = label
+            data.ly = 1
+            data.lx = 1
+            data.item = @conf["pass"]
+            data.iy = 1
+            data.ix = 16
+            data.flen = 253
+            data.ilen = 0
+            passitems.push(data.to_a)
+
+            dialog.title = "WebUI Password configuration"
+            form_results_password = dialog.passwordform(textpassword, passitems, 24, 60, 0)
+
+            if form_results_password.empty?
+                # Cancel button pushed
+                @cancel = true
+                break
+            else
+                addr = form_results["Address"]
+                user = form_results["User"]
+                password = form_results_password["Password"]
+                node_name = form_results["Sensor Name"]
+                cdomain = form_results["Domain name"]
+
+                if Config_utils.check_manager_credentials(addr, user, password)
+                    @conf[:host] = addr
+                    @conf[:user] = user
+                    @conf[:pass] = password
+                    @conf[:node_name] = node_name
+                    @conf[:cdomain] = cdomain
+                    break
+                end
+            end
+
+            # error, do another loop
+            dialog = MRDialog.new
+            dialog.clear = true
+            dialog.title = "ERROR when trying to login to the manager"
+            text = <<EOF
+
+We have detected an error while checking login credentials.
+
+Please, review host of the manager, username and password configuration.
+EOF
+            dialog.msgbox(text, 10, 41)
+        end
+    end
+end
+
+class DNSConf < WizConf
+
+    attr_accessor :conf, :cancel
+
+    def initialize()
+        @cancel = false
+        @conf = []
+    end
+
+    def doit
+
+        dns = {}
+        count=1
+        @conf.each do |x|
+            dns["DNS#{count}:"] = x
+            count+=1
+        end
+
+        loop do
+            dialog = MRDialog.new
+            dialog.clear = true
+            dialog.insecure = true
+            text = <<EOF
+
+Please, set DNS servers.
+
+You can set up to 3 DNS servers, but only one is mandatory. Set DNS values in order, first, second (optional) and then third (optional).
+
+Please, insert each value fo IPv4 address in dot notation.
+
+EOF
+            items = []
+            form_data = Struct.new(:label, :ly, :lx, :item, :iy, :ix, :flen, :ilen, :attr)
+
+            items = []
+            label = "DNS1:"
+            data = form_data.new
+            data.label = label
+            data.ly = 1
+            data.lx = 1
+            data.item = dns[label]
+            data.iy = 1
+            data.ix = 8
+            data.flen = 16
+            data.ilen = 0
+            data.attr = 0
+            items.push(data.to_a)
+
+            label = "DNS2:"
+            data = form_data.new
+            data.label = label
+            data.ly = 2
+            data.lx = 1
+            data.item = dns[label]
+            data.iy = 2
+            data.ix = 8
+            data.flen = 16
+            data.ilen = 0
+            data.attr = 0
+            items.push(data.to_a)
+
+            label = "DNS3:"
+            data = form_data.new
+            data.label = label
+            data.ly = 3
+            data.lx = 1
+            data.item = dns[label]
+            data.iy = 3
+            data.ix = 8
+            data.flen = 16
+            data.ilen = 0
+            data.attr = 0
+            items.push(data.to_a)
+
+            dialog.title = "DNS configuration"
+            dns = dialog.mixedform(text, items, 20, 42, 0)
+
+            if dns.empty?
+                # Cancel button pushed
+                @cancel = true
+                break
+            else
+                if Config_utils.check_ipv4({:ip=>dns["DNS1:"]})
+                    unless dns["DNS2:"].empty?
+                        if Config_utils.check_ipv4({:ip=>dns["DNS2:"]})
+                            unless dns["DNS3:"].empty?
+                                if Config_utils.check_ipv4({:ip=>dns["DNS3:"]})
+                                    break
+                                end
+                            else
+                                break
+                            end
+                        end
+                    else
+                        break
+                    end
+                end
+            end
+
+            # error, do another loop
+            dialog = MRDialog.new
+            dialog.clear = true
+            dialog.title = "ERROR in DNS or search configuration"
+            text = <<EOF
+
+We have detected an error in DNS configuration.
+
+Please, review content for DNS configuration. Remember, you
+must introduce only IPv4 address in dot notation.
+EOF
+            dialog.msgbox(text, 12, 41)
+
+        end
+
+        unless dns.empty?
+            @conf << dns["DNS1:"]
+            unless dns["DNS2:"].empty?
+                @conf << dns["DNS2:"]
+                unless dns["DNS3:"].empty?
+                    @conf << dns["DNS3:"]
+                end
+            end
+        end
+
+    end
+
+end
+
+## vim:ts=4:sw=4:expandtab:ai:nowrap:formatoptions=croqln:
