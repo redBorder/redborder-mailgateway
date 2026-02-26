@@ -64,18 +64,6 @@ open("/etc/redborder/rb_init_conf.conf", "w") { |f|
 # Set cdomain file
 File.open("/etc/redborder/cdomain", "w") { |f| f.puts "#{cdomain}" }
 
-puts "Loading rb_bpwatcher into kernel..."
-system("systemctl stop rb_bpwatcher")
-system("systemctl start rb_bpwatcher")
-sleep 15
-lsmod_output = `lsmod | grep rb_bpwatcher`
-
-if lsmod_output.strip.empty?
-  puts "Kernel module rb_bpwatcher is NOT loaded."
-else
-  puts "Kernel module rb_bpwatcher is loaded."
-end
-
 ####################
 # Set NETWORK      #
 ####################
