@@ -14,7 +14,6 @@ Requires: bash dialog dmidecode rsync nc telnet redborder-common redborder-chef-
 Requires: alternatives java-1.8.0-openjdk java-1.8.0-openjdk-devel
 Requires: network-scripts network-scripts-teamd
 Requires: chef-workstation
-Requires: redborder-cgroups
 Requires: ipmitool
 
 %description
@@ -132,5 +131,8 @@ update-alternatives --set java $(find /usr/lib/jvm/*java-1.8.0-openjdk* -name "j
 %doc
 
 %changelog
+* Wed Aug 5 2026 Nils Verschaeve <nverschaeve@redborder.com> - 0.1.0
+- Remove redborder-cgroups
+
 * Mon Feb 23 2026 Vicente Mesa <vimesa@redborder.com>
 - first spec version
