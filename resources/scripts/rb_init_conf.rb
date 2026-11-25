@@ -180,7 +180,7 @@ end
 ##############################
 # Accept chef-client license #
 ##############################
-system('chef-client --chef-license accept &>/dev/null')
+system('chef-client &>/dev/null')
 
 ####################
 # Set UTC timezone #
